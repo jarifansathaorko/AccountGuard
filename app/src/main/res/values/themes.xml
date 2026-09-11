@@ -1,0 +1,13 @@
+<resources>
+    <style name="Theme.AccountGuard" parent="android:Theme.Material.NoTitleBar">
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
+    </style>
+
+    <style name="Theme.AccountGuard.Splash" parent="Theme.SplashScreen">
+        <item name="windowSplashScreenBackground">#FF050D1A</item>
+        <item name="windowSplashScreenAnimatedIcon">@drawable/ic_launcher</item>
+        <item name="postSplashScreenTheme">@style/Theme.AccountGuard</item>
+    </style>
+</resources>

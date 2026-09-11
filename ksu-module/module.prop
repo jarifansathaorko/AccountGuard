@@ -1,0 +1,6 @@
+id=accountguard-boot
+name=AccountGuard Boot Service
+version=v1.0.0
+versionCode=1
+author=AccountGuard
+description=Boot service for AccountGuard: re-applies account visibility policies from accounts_de.db on every boot. Does not modify accounts table — only the visibility table.

@@ -1,0 +1,4 @@
+-keep class dev.accountguard.** { *; }
+-keep class com.topjohnwu.superuser.** { *; }
+-dontwarn com.topjohnwu.superuser.**
+-keep class androidx.room.** { *; }
