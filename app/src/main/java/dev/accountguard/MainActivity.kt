@@ -40,13 +40,16 @@ class AccountGuardApp : Application() {
     override fun onCreate() {
         super.onCreate()
 
+        // Initialize RootEngine with app context
+        dev.accountguard.root.RootEngine.init(this)
+
         // Initialize libsu Shell for root operations
-        // KernelSU-Next is fully compatible with libsu
+        // FLAG_MOUNT_MASTER ensures access to global/master mount namespace for DE/CE databases
         Shell.enableVerboseLogging = false
         Shell.setDefaultBuilder(
             Shell.Builder.create()
-                .setFlags(Shell.FLAG_REDIRECT_STDERR)
-                .setTimeout(10)
+                .setFlags(Shell.FLAG_REDIRECT_STDERR or Shell.FLAG_MOUNT_MASTER)
+                .setTimeout(15)
         )
 
         // Initialize Room database

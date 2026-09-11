@@ -1,38 +1,285 @@
 package dev.accountguard.root
 
+import android.content.Context
+import android.os.Build
+import android.util.Base64
 import android.util.Log
 import com.topjohnwu.superuser.Shell
 import dev.accountguard.data.model.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.io.File
+import java.io.FileOutputStream
 
 /**
  * RootEngine — the core privileged operations layer.
  *
- * All operations here communicate with the Android system via root shell
- * using libsu (KernelSU-Next compatible). Operations are performed against:
- *   - /data/system_de/0/accounts_de.db  (Device Encrypted — always accessible after boot)
- *   - /data/system_ce/0/accounts_ce.db  (Credential Encrypted — accessible after screen unlock)
+ * Communicates with the Android system via root shell using libsu
+ * (KernelSU-Next / Magisk / APatch compatible).
  *
- * The visibility table in these DBs controls what each package can see via AccountManager.
+ * TRIPLE-TIER SQLITE EXECUTION:
+ *   1. Bundled static `sqlite3` binary (self-contained, extracted from assets to /data/local/tmp)
+ *   2. System/Module `sqlite3` CLI if installed
+ *   3. Built-in `SqliteCli` via `/system/bin/app_process` (zero binary dependency)
  *
- * ARCHITECTURE DECISION: We ONLY modify the `visibility` table.
- * We NEVER modify the `accounts` table.
- * This guarantees accounts remain installed and login state is preserved.
+ * DYNAMIC DATABASE RESOLUTION:
+ *   Probes all CE, DE, and legacy account database paths across active user boundaries.
+ *   Automatically identifies which database hosts the `accounts` table and which hosts
+ *   the `visibility` table.
  */
 object RootEngine {
 
     private const val TAG = "AccountGuard.Root"
 
-    // ─────────────────────────────────────────────────────────────
-    // DB paths — Xiaomi xaga / Lunaris AOSP (user 0)
-    // ─────────────────────────────────────────────────────────────
-    private const val USER_ID = 0
-    private val DB_DE = "/data/system_de/$USER_ID/accounts_de.db"
-    private val DB_CE = "/data/system_ce/$USER_ID/accounts_ce.db"
+    private var appContext: Context? = null
+    private var appSourceDir: String? = null
+    private var sqlite3Binary: String? = null
+    private var activeEngine: String = "Detecting..."
 
-    // Broadcast to flush AccountManagerService cache after DB changes
+    // Resolved database locations
+    private var resolvedDbAccounts: String? = null
+    private var resolvedDbVisibility: String? = null
+    private val allDiscoveredDbs = mutableSetOf<String>()
+    private var isPathsResolved = false
+
+    private const val BUNDLED_SQLITE_TMP = "/data/local/tmp/accountguard_sqlite3"
     private const val ACCOUNTS_CHANGED_ACTION = "android.accounts.LOGIN_ACCOUNTS_CHANGED_ACTION"
+
+    data class SqlResult(
+        val isSuccess: Boolean,
+        val out: List<String> = emptyList(),
+        val err: List<String> = emptyList(),
+        val code: Int = 0
+    )
+
+    fun init(context: Context) {
+        appContext = context.applicationContext
+        appSourceDir = context.applicationInfo.sourceDir
+        Log.i(TAG, "RootEngine initialized with APK sourceDir: $appSourceDir")
+
+        // Asynchronously prepare bundled static sqlite3 binary
+        Thread {
+            try {
+                deployBundledSqlite(context)
+            } catch (e: Exception) {
+                Log.w(TAG, "Bundled sqlite deployment deferred: ${e.message}")
+            }
+        }.start()
+    }
+
+    private fun deployBundledSqlite(context: Context) {
+        val abi = Build.SUPPORTED_ABIS.firstOrNull() ?: "arm64-v8a"
+        val assetName = when {
+            abi.contains("arm64") -> "sqlite3.arm64"
+            abi.contains("armeabi") || abi.contains("arm") -> "sqlite3.arm"
+            abi.contains("x86_64") -> "sqlite3.x64"
+            abi.contains("x86") -> "sqlite3.x86"
+            else -> "sqlite3.arm64"
+        }
+
+        try {
+            val localFile = File(context.filesDir, "sqlite3_bin")
+            context.assets.open("bin/$assetName").use { input ->
+                FileOutputStream(localFile).use { output ->
+                    input.copyTo(output)
+                }
+            }
+            localFile.setExecutable(true, false)
+
+            // Copy to /data/local/tmp via root for unrestricted execution in root domain
+            val copyCmd = "cp \"${localFile.absolutePath}\" \"$BUNDLED_SQLITE_TMP\" && chmod 755 \"$BUNDLED_SQLITE_TMP\""
+            Shell.cmd(copyCmd).exec()
+            Log.i(TAG, "Deployed bundled static sqlite3 ($assetName) to $BUNDLED_SQLITE_TMP")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to deploy bundled sqlite3", e)
+        }
+    }
+
+    private fun getApkPath(): String? {
+        if (!appSourceDir.isNullOrEmpty()) return appSourceDir
+        val out = Shell.cmd("pm path dev.accountguard 2>/dev/null | head -n 1 | cut -d: -f2").exec().out.firstOrNull()?.trim()
+        if (!out.isNullOrEmpty()) {
+            appSourceDir = out
+        }
+        return appSourceDir
+    }
+
+    private fun findSqlite3Binary(): String? {
+        if (sqlite3Binary != null) return sqlite3Binary
+
+        // 1. Check bundled static binary in /data/local/tmp
+        val bundledTest = Shell.cmd("[ -x \"$BUNDLED_SQLITE_TMP\" ] && \"$BUNDLED_SQLITE_TMP\" --version 2>/dev/null").exec()
+        if (bundledTest.isSuccess && bundledTest.out.isNotEmpty()) {
+            sqlite3Binary = BUNDLED_SQLITE_TMP
+            Log.i(TAG, "Using bundled static sqlite3: $sqlite3Binary (${bundledTest.out.first()})")
+            return sqlite3Binary
+        }
+
+        // Try extracting if not present
+        appContext?.let { ctx ->
+            deployBundledSqlite(ctx)
+            val retry = Shell.cmd("[ -x \"$BUNDLED_SQLITE_TMP\" ] && \"$BUNDLED_SQLITE_TMP\" --version 2>/dev/null").exec()
+            if (retry.isSuccess && retry.out.isNotEmpty()) {
+                sqlite3Binary = BUNDLED_SQLITE_TMP
+                return sqlite3Binary
+            }
+        }
+
+        // 2. Check system and module binaries
+        val candidates = listOf(
+            "sqlite3",
+            "/system/bin/sqlite3",
+            "/system/xbin/sqlite3",
+            "/data/adb/ksu/bin/sqlite3",
+            "/data/adb/magisk/sqlite3",
+            "/data/adb/ap/bin/sqlite3",
+            "/apex/com.android.runtime/bin/sqlite3"
+        )
+
+        for (candidate in candidates) {
+            val test = Shell.cmd("$candidate --version 2>/dev/null").exec()
+            if (test.isSuccess && test.out.isNotEmpty()) {
+                sqlite3Binary = candidate
+                Log.i(TAG, "Found working system sqlite3: $candidate")
+                return candidate
+            }
+        }
+
+        // Search root modules
+        val modCheck = Shell.cmd("find /data/adb/modules -name sqlite3 -type f 2>/dev/null").exec()
+        if (modCheck.isSuccess && modCheck.out.isNotEmpty()) {
+            for (cand in modCheck.out) {
+                val trimmed = cand.trim()
+                val test = Shell.cmd("$trimmed --version 2>/dev/null").exec()
+                if (test.isSuccess && test.out.isNotEmpty()) {
+                    sqlite3Binary = trimmed
+                    Log.i(TAG, "Found sqlite3 in module: $trimmed")
+                    return trimmed
+                }
+            }
+        }
+
+        return null
+    }
+
+    /**
+     * Deep scan for accounts and visibility database files.
+     */
+    private fun resolveDbPaths() {
+        if (isPathsResolved && resolvedDbAccounts != null) return
+
+        val userOut = Shell.cmd("am get-current-user 2>/dev/null").exec().out.firstOrNull()?.trim()
+        val userId = userOut?.toIntOrNull() ?: 0
+
+        val probeCmd = """
+for p in \
+  "/data/system_ce/$userId/accounts_ce.db" \
+  "/data/system_de/$userId/accounts_de.db" \
+  "/data/system_ce/0/accounts_ce.db" \
+  "/data/system_de/0/accounts_de.db" \
+  "/data/system/users/$userId/accounts.db" \
+  "/data/system/users/0/accounts.db" \
+  "/data/system/users/$userId/accounts_ce.db" \
+  "/data/system/users/0/accounts_ce.db" \
+  "/data/system/users/$userId/accounts_de.db" \
+  "/data/system/users/0/accounts_de.db" \
+  "/data/system/accounts.db" \
+  "/data/system/accounts_ce.db" \
+  "/data/system/accounts_de.db" \
+  /data/system_ce/*/accounts_ce.db \
+  /data/system_de/*/accounts_de.db \
+  /data/system/users/*/accounts*.db
+do
+  [ -f "${'$'}p" ] && echo "${'$'}p"
+done
+"""
+        val probeRes = Shell.cmd(probeCmd).exec()
+        val candidates = probeRes.out.map { it.trim() }.filter { it.endsWith(".db") }.distinct().toMutableList()
+
+        if (candidates.isEmpty()) {
+            val findRes = Shell.cmd("find /data/system_ce /data/system_de /data/system /data/user_de -maxdepth 3 -name '*account*.db' 2>/dev/null").exec()
+            candidates.addAll(findRes.out.map { it.trim() }.filter { it.endsWith(".db") }.distinct())
+        }
+
+        Log.i(TAG, "Found ${candidates.size} candidate account databases: $candidates")
+        allDiscoveredDbs.clear()
+        allDiscoveredDbs.addAll(candidates)
+
+        // Test each database for accounts and visibility tables
+        for (candidate in candidates) {
+            val resAccounts = runRawSql(candidate, "SELECT COUNT(*) FROM accounts;")
+            if (resAccounts.isSuccess) {
+                if (resolvedDbAccounts == null) {
+                    resolvedDbAccounts = candidate
+                    Log.i(TAG, "Resolved primary accounts DB: $candidate")
+                }
+            }
+
+            val resVis = runRawSql(candidate, "SELECT COUNT(*) FROM visibility;")
+            if (resVis.isSuccess) {
+                if (resolvedDbVisibility == null) {
+                    resolvedDbVisibility = candidate
+                    Log.i(TAG, "Resolved primary visibility DB: $candidate")
+                }
+            }
+        }
+
+        // If visibility DB wasn't found, use accounts DB and create visibility table
+        if (resolvedDbVisibility == null && resolvedDbAccounts != null) {
+            resolvedDbVisibility = resolvedDbAccounts
+            val createVisSql = "CREATE TABLE IF NOT EXISTS visibility (_id INTEGER PRIMARY KEY AUTOINCREMENT, accounts_id INTEGER NOT NULL, package_name TEXT NOT NULL, visibility INTEGER NOT NULL, UNIQUE(accounts_id, package_name));"
+            runRawSql(resolvedDbVisibility!!, createVisSql)
+            Log.i(TAG, "Created visibility table in: $resolvedDbVisibility")
+        }
+
+        // Final fallback if nothing was discovered
+        if (resolvedDbAccounts == null) {
+            resolvedDbAccounts = "/data/system_ce/0/accounts_ce.db"
+        }
+        if (resolvedDbVisibility == null) {
+            resolvedDbVisibility = "/data/system_de/0/accounts_de.db"
+        }
+
+        isPathsResolved = true
+    }
+
+    private fun runRawSql(dbPath: String, sql: String): SqlResult {
+        val base64Sql = Base64.encodeToString(sql.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
+
+        // 1. Try static / system sqlite3 binary
+        val binary = findSqlite3Binary()
+        if (binary != null) {
+            val cmd = "echo \"$base64Sql\" | base64 -d | $binary \"$dbPath\" 2>&1"
+            val res = Shell.cmd(cmd).exec()
+            if (res.isSuccess) {
+                activeEngine = if (binary == BUNDLED_SQLITE_TMP) "Static sqlite3 (in-app)" else "System ($binary)"
+                return SqlResult(true, res.out, res.err, res.code)
+            } else {
+                Log.w(TAG, "sqlite3 ($binary) failed on $dbPath: ${res.out.joinToString(" ")}")
+            }
+        }
+
+        // 2. Try built-in SqliteCli via app_process
+        val apk = getApkPath()
+        if (!apk.isNullOrEmpty()) {
+            val appProcessCmd = "CLASSPATH=\"$apk\" /system/bin/app_process /system/bin dev.accountguard.root.SqliteCli \"$dbPath\" \"$base64Sql\" 2>&1"
+            val res = Shell.cmd(appProcessCmd).exec()
+            if (res.isSuccess) {
+                activeEngine = "Built-in Framework (app_process)"
+                return SqlResult(true, res.out, res.err, res.code)
+            } else {
+                Log.w(TAG, "SqliteCli failed on $dbPath: ${res.out.joinToString(" ")}")
+                return SqlResult(false, res.out, res.err, res.code)
+            }
+        }
+
+        return SqlResult(false, emptyList(), listOf("No SQLite executor available"), 1)
+    }
+
+    private fun runSql(dbPath: String, sql: String): SqlResult {
+        resolveDbPaths()
+        return runRawSql(dbPath, sql)
+    }
 
     // ─────────────────────────────────────────────────────────────
     // ROOT STATUS
@@ -46,22 +293,25 @@ object RootEngine {
                     isRootAvailable = false,
                     rootType = "None",
                     isPrivilegeVerified = false,
-                    errorMessage = "Shell is not running as root"
+                    errorMessage = "Root permission not granted"
                 )
             }
 
-            // Detect root type
             val rootType = detectRootType()
+            resolveDbPaths()
 
-            // Verify we can actually read the system DB (ultimate test)
-            val verifyResult = Shell.cmd("sqlite3 $DB_DE 'SELECT COUNT(*) FROM accounts;' 2>&1").exec()
+            val primaryDb = resolvedDbAccounts ?: "/data/system_ce/0/accounts_ce.db"
+            val verifyResult = runSql(primaryDb, "SELECT COUNT(*) FROM accounts;")
             val privilegeVerified = verifyResult.isSuccess && verifyResult.out.isNotEmpty()
 
-            // Check for Vector/LSPosed
+            val errorMsg = if (!privilegeVerified) {
+                val detail = (verifyResult.err + verifyResult.out).joinToString(" ").trim()
+                if (detail.isNotEmpty()) detail else "Cannot query accounts database"
+            } else ""
+
             val vectorResult = Shell.cmd("ls /data/adb/modules/ 2>/dev/null | grep -i vector").exec()
             val vectorDetected = vectorResult.isSuccess && vectorResult.out.isNotEmpty()
 
-            // KSU version
             val ksuVersion = if (rootType == "KernelSU") {
                 Shell.cmd("ksud --version 2>/dev/null").exec().out.firstOrNull() ?: ""
             } else ""
@@ -71,7 +321,10 @@ object RootEngine {
                 rootType = rootType,
                 isPrivilegeVerified = privilegeVerified,
                 ksuVersion = ksuVersion,
-                vectorDetected = vectorDetected
+                vectorDetected = vectorDetected,
+                errorMessage = errorMsg,
+                engineName = activeEngine,
+                resolvedDbPath = primaryDb
             )
         } catch (e: Exception) {
             Log.e(TAG, "Root check failed", e)
@@ -91,161 +344,209 @@ object RootEngine {
         val magiskCheck = Shell.cmd("[ -d /data/adb/magisk ] && echo MAGISK").exec()
         if (magiskCheck.isSuccess && magiskCheck.out.contains("MAGISK")) return "Magisk"
 
-        return "Unknown"
+        val apatchCheck = Shell.cmd("[ -d /data/adb/ap ] && echo APATCH").exec()
+        if (apatchCheck.isSuccess && apatchCheck.out.contains("APATCH")) return "APatch"
+
+        return "Root (su)"
     }
 
     // ─────────────────────────────────────────────────────────────
     // ACCOUNT DETECTION
-    // Reads from accounts_de.db — the source of truth
+    // Reads directly from the resolved accounts database
     // ─────────────────────────────────────────────────────────────
 
     suspend fun detectGoogleAccounts(): List<GoogleAccount> = withContext(Dispatchers.IO) {
         try {
-            val result = Shell.cmd(
-                "sqlite3 $DB_DE 'SELECT _id, name FROM accounts WHERE type=\"com.google\" ORDER BY name ASC;'"
-            ).exec()
+            resolveDbPaths()
+            val dbToQuery = resolvedDbAccounts ?: return@withContext detectFromDumpsys()
 
-            if (!result.isSuccess) {
-                Log.e(TAG, "Failed to query accounts: ${result.err}")
-                return@withContext emptyList()
+            // 1. Primary query targeting Google accounts
+            val query1 = "SELECT _id, name FROM accounts WHERE type='com.google' OR name LIKE '%@gmail.com' OR name LIKE '%@googlemail.com' ORDER BY name ASC;"
+            val result = runSql(dbToQuery, query1)
+
+            if (result.isSuccess && result.out.isNotEmpty()) {
+                val accounts = result.out.mapNotNull { line ->
+                    val parts = line.split("|")
+                    if (parts.size >= 2) {
+                        val id = parts[0].trim().toLongOrNull() ?: return@mapNotNull null
+                        val name = parts[1].trim()
+                        if (name.isNotEmpty()) GoogleAccount(dbId = id, name = name) else null
+                    } else null
+                }
+                if (accounts.isNotEmpty()) {
+                    Log.i(TAG, "Detected ${accounts.size} Google accounts from $dbToQuery")
+                    return@withContext accounts
+                }
             }
 
-            result.out.mapNotNull { line ->
-                val parts = line.split("|")
-                if (parts.size >= 2) {
-                    GoogleAccount(
-                        dbId = parts[0].trim().toLongOrNull() ?: return@mapNotNull null,
-                        name = parts[1].trim()
-                    )
-                } else null
+            // 2. Fetch all accounts and filter in Kotlin
+            val queryAll = "SELECT _id, name, type FROM accounts ORDER BY name ASC;"
+            val resultAll = runSql(dbToQuery, queryAll)
+            if (resultAll.isSuccess && resultAll.out.isNotEmpty()) {
+                val accounts = resultAll.out.mapNotNull { line ->
+                    val parts = line.split("|")
+                    if (parts.size >= 3) {
+                        val id = parts[0].trim().toLongOrNull() ?: return@mapNotNull null
+                        val name = parts[1].trim()
+                        val type = parts[2].trim()
+                        if (type == "com.google" || name.contains("@gmail.com") || name.contains("@googlemail.com")) {
+                            GoogleAccount(dbId = id, name = name)
+                        } else null
+                    } else null
+                }
+                if (accounts.isNotEmpty()) {
+                    Log.i(TAG, "Detected ${accounts.size} accounts via secondary query on $dbToQuery")
+                    return@withContext accounts
+                }
             }
+
+            // 3. Fallback to native dumpsys account
+            val dumpsysAccounts = detectFromDumpsys()
+            if (dumpsysAccounts.isNotEmpty()) {
+                Log.i(TAG, "Detected ${dumpsysAccounts.size} accounts via dumpsys fallback")
+                return@withContext dumpsysAccounts
+            }
+
+            Log.w(TAG, "No Google accounts detected on device")
+            emptyList()
         } catch (e: Exception) {
             Log.e(TAG, "Account detection failed", e)
-            emptyList()
+            detectFromDumpsys()
         }
+    }
+
+    private fun detectFromDumpsys(): List<GoogleAccount> {
+        val dump = Shell.cmd("dumpsys account 2>&1").exec()
+        if (!dump.isSuccess) return emptyList()
+
+        val found = mutableListOf<GoogleAccount>()
+        var fallbackId = 1L
+
+        val patterns = listOf(
+            Regex("""Account\s*\{\s*name=([^,\}]+),\s*type=com\.google\s*\}"""),
+            Regex("""name=([^,\}]+),\s*type=com\.google"""),
+            Regex("""([a-zA-Z0-9._%+-]+@gmail\.com)"""),
+            Regex("""([a-zA-Z0-9._%+-]+@googlemail\.com)""")
+        )
+
+        dump.out.forEach { line ->
+            for (pattern in patterns) {
+                pattern.find(line)?.let { match ->
+                    val name = match.groupValues[1].trim()
+                    if (name.isNotEmpty() && found.none { it.name.equals(name, ignoreCase = true) }) {
+                        found.add(GoogleAccount(dbId = fallbackId++, name = name))
+                    }
+                }
+            }
+        }
+        return found
     }
 
     // ─────────────────────────────────────────────────────────────
     // VISIBILITY CONTROL
-    // Core mechanism: write to visibility table in accounts_de.db
+    // Modifies visibility table in the resolved visibility database(s)
     // ─────────────────────────────────────────────────────────────
 
-    /**
-     * Hide a Google account from a specific package.
-     *
-     * This writes VISIBILITY_NOT_VISIBLE (4) into accounts_de.db visibility table
-     * for the (account_id, package_name) pair.
-     *
-     * The account remains installed — credentials, tokens, sync state are untouched.
-     * To restore: call showAccountFromPackage() with the same parameters.
-     *
-     * @param accountDbId   The _id from accounts_de.db accounts table
-     * @param targetPackage The package to hide from, or special keys for bulk targets
-     * @return true if operation succeeded
-     */
     suspend fun hideAccountFromPackage(
         accountDbId: Long,
         targetPackage: String
     ): Boolean = withContext(Dispatchers.IO) {
         try {
             when (targetPackage) {
-                "__SYNC__" -> return@withContext disableAccountSync(accountDbId)
-                "__ACCOUNT_PICKER__" -> return@withContext hideFromAccountPicker(accountDbId)
-                "__THIRD_PARTY__" -> return@withContext hideFromThirdParty(accountDbId)
-                else -> return@withContext writeVisibility(accountDbId, targetPackage, VisibilityState.HIDDEN)
+                "__SYNC__" -> disableAccountSync(accountDbId)
+                "__ACCOUNT_PICKER__" -> hideFromAccountPicker(accountDbId)
+                "__THIRD_PARTY__" -> hideFromThirdParty(accountDbId)
+                else -> writeVisibility(accountDbId, targetPackage, VisibilityState.HIDDEN)
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Hide operation failed for dbId=$accountDbId pkg=$targetPackage", e)
+            Log.e(TAG, "Hide failed: dbId=$accountDbId pkg=$targetPackage", e)
             false
         }
     }
 
-    /**
-     * Restore visibility of a Google account to a specific package.
-     * No re-login required — the account was never removed.
-     */
     suspend fun showAccountFromPackage(
         accountDbId: Long,
         targetPackage: String
     ): Boolean = withContext(Dispatchers.IO) {
         try {
             when (targetPackage) {
-                "__SYNC__" -> return@withContext enableAccountSync(accountDbId)
-                "__ACCOUNT_PICKER__" -> return@withContext showFromAccountPicker(accountDbId)
-                "__THIRD_PARTY__" -> return@withContext showFromThirdParty(accountDbId)
+                "__SYNC__" -> enableAccountSync(accountDbId)
+                "__ACCOUNT_PICKER__" -> showFromAccountPicker(accountDbId)
+                "__THIRD_PARTY__" -> showFromThirdParty(accountDbId)
                 else -> {
-                    // Delete the explicit visibility entry → falls back to default (visible)
-                    val result = Shell.cmd(
-                        "sqlite3 $DB_DE 'DELETE FROM visibility WHERE accounts_id=$accountDbId AND package_name=\"$targetPackage\";' 2>&1"
-                    ).exec()
-                    if (result.isSuccess) {
+                    resolveDbPaths()
+                    val sql = "DELETE FROM visibility WHERE accounts_id=$accountDbId AND package_name='$targetPackage';"
+                    val dbsToWrite = (listOfNotNull(resolvedDbVisibility, resolvedDbAccounts) + allDiscoveredDbs).distinct()
+                    var anySuccess = false
+
+                    for (db in dbsToWrite) {
+                        val res = runSql(db, sql)
+                        if (res.isSuccess) anySuccess = true
+                    }
+
+                    if (anySuccess) {
                         broadcastAccountsChanged()
                         Log.i(TAG, "Restored visibility: dbId=$accountDbId pkg=$targetPackage")
                         true
                     } else {
-                        Log.e(TAG, "Restore failed: ${result.err}")
+                        Log.e(TAG, "Restore visibility failed across all databases")
                         false
                     }
                 }
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Show operation failed", e)
+            Log.e(TAG, "Show failed", e)
             false
         }
     }
 
-    /**
-     * Write a specific visibility value to both accounts_de.db (and accounts_ce.db if accessible).
-     * Uses INSERT OR REPLACE to handle both new entries and updates.
-     */
     private fun writeVisibility(
         accountDbId: Long,
         packageName: String,
         state: VisibilityState
     ): Boolean {
+        resolveDbPaths()
         val sql = "INSERT OR REPLACE INTO visibility (accounts_id, package_name, visibility) VALUES ($accountDbId, '$packageName', ${state.dbValue});"
+        val dbsToWrite = (listOfNotNull(resolvedDbVisibility, resolvedDbAccounts) + allDiscoveredDbs).distinct()
 
-        // Write to DE database (always accessible after boot)
-        val deResult = Shell.cmd("sqlite3 $DB_DE '$sql' 2>&1").exec()
-        if (!deResult.isSuccess) {
-            Log.e(TAG, "DE DB write failed: ${deResult.err}")
-            return false
+        var writtenCount = 0
+        for (db in dbsToWrite) {
+            val res = runSql(db, sql)
+            if (res.isSuccess) {
+                writtenCount++
+            }
         }
 
-        // Also write to CE database if accessible (post-unlock)
-        // Ignore errors here — CE may not be accessible in edge cases
-        Shell.cmd("sqlite3 $DB_CE '$sql' 2>/dev/null").exec()
+        if (writtenCount > 0) {
+            broadcastAccountsChanged()
+            Log.i(TAG, "Visibility set in $writtenCount database(s): dbId=$accountDbId pkg=$packageName state=${state.name}")
+            return true
+        }
 
-        broadcastAccountsChanged()
-        Log.i(TAG, "Visibility set: dbId=$accountDbId pkg=$packageName state=${state.name}")
-        return true
+        Log.e(TAG, "Failed to write visibility to any database")
+        return false
     }
 
     // ─────────────────────────────────────────────────────────────
     // SPECIAL TARGETS
     // ─────────────────────────────────────────────────────────────
 
-    /**
-     * Account Picker: hide by setting VISIBILITY_NOT_VISIBLE for the system account picker
-     * package. On AOSP/Android 16, account pickers run in the context of
-     * "android" (system server) — we use the special legacy key for this.
-     */
     private fun hideFromAccountPicker(accountDbId: Long): Boolean {
         return writeVisibility(accountDbId, "android", VisibilityState.HIDDEN)
     }
 
     private fun showFromAccountPicker(accountDbId: Long): Boolean {
-        val result = Shell.cmd(
-            "sqlite3 $DB_DE 'DELETE FROM visibility WHERE accounts_id=$accountDbId AND package_name=\"android\";' 2>&1"
-        ).exec()
-        return if (result.isSuccess) { broadcastAccountsChanged(); true } else false
+        resolveDbPaths()
+        val sql = "DELETE FROM visibility WHERE accounts_id=$accountDbId AND package_name='android';"
+        val dbs = (listOfNotNull(resolvedDbVisibility, resolvedDbAccounts) + allDiscoveredDbs).distinct()
+        var ok = false
+        for (db in dbs) {
+            if (runSql(db, sql).isSuccess) ok = true
+        }
+        if (ok) broadcastAccountsChanged()
+        return ok
     }
 
-    /**
-     * Third-party apps: set the PACKAGE_NAME_KEY_LEGACY_NOT_VISIBLE key.
-     * This is the default fallback for any package not explicitly listed.
-     * Hides from ALL apps without an explicit visibility entry.
-     */
     private fun hideFromThirdParty(accountDbId: Long): Boolean {
         return writeVisibility(
             accountDbId,
@@ -255,30 +556,30 @@ object RootEngine {
     }
 
     private fun showFromThirdParty(accountDbId: Long): Boolean {
-        val result = Shell.cmd(
-            "sqlite3 $DB_DE 'DELETE FROM visibility WHERE accounts_id=$accountDbId AND package_name=\"__PACKAGE_NAME_KEY_LEGACY_NOT_VISIBLE__\";' 2>&1"
-        ).exec()
-        return if (result.isSuccess) { broadcastAccountsChanged(); true } else false
+        resolveDbPaths()
+        val sql = "DELETE FROM visibility WHERE accounts_id=$accountDbId AND package_name='__PACKAGE_NAME_KEY_LEGACY_NOT_VISIBLE__';"
+        val dbs = (listOfNotNull(resolvedDbVisibility, resolvedDbAccounts) + allDiscoveredDbs).distinct()
+        var ok = false
+        for (db in dbs) {
+            if (runSql(db, sql).isSuccess) ok = true
+        }
+        if (ok) broadcastAccountsChanged()
+        return ok
     }
 
     // ─────────────────────────────────────────────────────────────
     // SYNC CONTROL
-    // ContentResolver sync is separate from account visibility
     // ─────────────────────────────────────────────────────────────
 
     private fun disableAccountSync(accountDbId: Long): Boolean {
-        // Get account name from DB
-        val nameResult = Shell.cmd(
-            "sqlite3 $DB_DE 'SELECT name FROM accounts WHERE _id=$accountDbId;'"
-        ).exec()
+        val targetDb = resolvedDbAccounts ?: return false
+        val nameResult = runSql(targetDb, "SELECT name FROM accounts WHERE _id=$accountDbId;")
         val accountName = nameResult.out.firstOrNull()?.trim() ?: return false
 
-        // Disable sync via content provider
         val result = Shell.cmd(
             "content call --uri content://com.android.sync/syncstatus --method disableAllSync --arg '$accountName:com.google' 2>&1"
         ).exec()
 
-        // Fallback: use syncmanager shell command
         if (!result.isSuccess) {
             Shell.cmd("am broadcast -a android.intent.action.SYNC_CONNECTION_CHANGE --ez connected false 2>/dev/null").exec()
         }
@@ -288,16 +589,15 @@ object RootEngine {
     }
 
     private fun enableAccountSync(accountDbId: Long): Boolean {
-        val nameResult = Shell.cmd(
-            "sqlite3 $DB_DE 'SELECT name FROM accounts WHERE _id=$accountDbId;'"
-        ).exec()
+        val targetDb = resolvedDbAccounts ?: return false
+        val nameResult = runSql(targetDb, "SELECT name FROM accounts WHERE _id=$accountDbId;")
         val accountName = nameResult.out.firstOrNull()?.trim() ?: return false
 
         val result = Shell.cmd(
             "content call --uri content://com.android.sync/syncstatus --method enableAllSync --arg '$accountName:com.google' 2>&1"
         ).exec()
 
-        Log.i(TAG, "Sync enabled for account dbId=$accountDbId name=$accountName (result=${result.isSuccess})")
+        Log.i(TAG, "Sync enabled for account dbId=$accountDbId name=$accountName")
         return true
     }
 
@@ -305,40 +605,34 @@ object RootEngine {
     // RECOVERY
     // ─────────────────────────────────────────────────────────────
 
-    /**
-     * Restore ALL visibility entries for a specific account.
-     * Removes all custom visibility rows → account becomes fully visible everywhere.
-     * NO re-login required.
-     */
     suspend fun restoreAllPoliciesForAccount(accountDbId: Long): Boolean = withContext(Dispatchers.IO) {
         try {
-            val sql1 = "DELETE FROM visibility WHERE accounts_id=$accountDbId;"
-            val r1 = Shell.cmd("sqlite3 $DB_DE '$sql1' 2>&1").exec()
-            Shell.cmd("sqlite3 $DB_CE '$sql1' 2>/dev/null").exec()
-
+            resolveDbPaths()
+            val sql = "DELETE FROM visibility WHERE accounts_id=$accountDbId;"
+            val dbs = (listOfNotNull(resolvedDbVisibility, resolvedDbAccounts) + allDiscoveredDbs).distinct()
+            var ok = false
+            for (db in dbs) {
+                if (runSql(db, sql).isSuccess) ok = true
+            }
             broadcastAccountsChanged()
             Log.i(TAG, "Restored all policies for account dbId=$accountDbId")
-            r1.isSuccess
+            ok
         } catch (e: Exception) {
             Log.e(TAG, "Restore failed", e)
             false
         }
     }
 
-    /**
-     * EMERGENCY RECOVERY: Remove ALL custom visibility entries for ALL accounts.
-     * This fully restores the original Android account visibility state.
-     * Call this if something goes wrong and you want to reset everything.
-     */
     suspend fun emergencyRecoverAllAccounts(): Boolean = withContext(Dispatchers.IO) {
         try {
-            // Keep only the built-in legacy keys if they existed before
-            val sql = "DELETE FROM visibility WHERE package_name NOT IN ('__PACKAGE_NAME_KEY_LEGACY_VISIBLE__') OR 1=1;"
+            resolveDbPaths()
             val clearAll = "DELETE FROM visibility;"
-            Shell.cmd("sqlite3 $DB_DE '$clearAll' 2>&1").exec()
-            Shell.cmd("sqlite3 $DB_CE '$clearAll' 2>/dev/null").exec()
+            val dbs = (listOfNotNull(resolvedDbVisibility, resolvedDbAccounts) + allDiscoveredDbs).distinct()
+            for (db in dbs) {
+                runSql(db, clearAll)
+            }
             broadcastAccountsChanged()
-            Log.i(TAG, "Emergency recovery completed — all visibility entries cleared")
+            Log.i(TAG, "Emergency recovery completed — cleared visibility in all databases")
             true
         } catch (e: Exception) {
             Log.e(TAG, "Emergency recovery failed", e)
@@ -350,32 +644,29 @@ object RootEngine {
     // VERIFICATION
     // ─────────────────────────────────────────────────────────────
 
-    /**
-     * Verify the actual DB state matches the requested policy.
-     * Returns VerificationResult based on what we find in the DB.
-     */
     suspend fun verifyPolicy(
         accountDbId: Long,
         targetPackage: String,
         expectedState: VisibilityState
     ): VerificationResult = withContext(Dispatchers.IO) {
         try {
+            resolveDbPaths()
+            val targetDb = resolvedDbVisibility ?: resolvedDbAccounts ?: return@withContext VerificationResult.UNKNOWN
+
             when (targetPackage) {
-                "__SYNC__" -> return@withContext VerificationResult.UNKNOWN // sync harder to verify
+                "__SYNC__" -> VerificationResult.UNKNOWN
                 "__THIRD_PARTY__" -> {
-                    val result = Shell.cmd(
-                        "sqlite3 $DB_DE 'SELECT visibility FROM visibility WHERE accounts_id=$accountDbId AND package_name=\"__PACKAGE_NAME_KEY_LEGACY_NOT_VISIBLE__\";'"
-                    ).exec()
+                    val sql = "SELECT visibility FROM visibility WHERE accounts_id=$accountDbId AND package_name='__PACKAGE_NAME_KEY_LEGACY_NOT_VISIBLE__';"
+                    val result = runSql(targetDb, sql)
                     val found = result.out.firstOrNull()?.trim()?.toIntOrNull()
-                    return@withContext if (found == expectedState.dbValue) VerificationResult.PASS
+                    if (found == expectedState.dbValue) VerificationResult.PASS
                     else VerificationResult.FAIL
                 }
                 else -> {
-                    val result = Shell.cmd(
-                        "sqlite3 $DB_DE 'SELECT visibility FROM visibility WHERE accounts_id=$accountDbId AND package_name=\"$targetPackage\";'"
-                    ).exec()
+                    val sql = "SELECT visibility FROM visibility WHERE accounts_id=$accountDbId AND package_name='$targetPackage';"
+                    val result = runSql(targetDb, sql)
                     val found = result.out.firstOrNull()?.trim()?.toIntOrNull()
-                    return@withContext when {
+                    when {
                         found == null && expectedState == VisibilityState.VISIBLE -> VerificationResult.PASS
                         found == expectedState.dbValue -> VerificationResult.PASS
                         else -> VerificationResult.FAIL
@@ -388,35 +679,20 @@ object RootEngine {
         }
     }
 
-    /**
-     * Get a full visibility dump for an account — for the diagnostics screen.
-     */
     suspend fun getVisibilityDump(accountDbId: Long): String = withContext(Dispatchers.IO) {
-        val result = Shell.cmd(
-            "sqlite3 $DB_DE 'SELECT package_name, visibility FROM visibility WHERE accounts_id=$accountDbId;'"
-        ).exec()
+        resolveDbPaths()
+        val targetDb = resolvedDbVisibility ?: resolvedDbAccounts ?: return@withContext "No database found"
+        val result = runSql(targetDb, "SELECT package_name, visibility FROM visibility WHERE accounts_id=$accountDbId;")
         result.out.joinToString("\n").ifEmpty { "No visibility entries found" }
     }
 
-    /**
-     * Get a sanitized dumpsys account snapshot (no tokens logged).
-     */
     suspend fun getDumpsysSnapshot(): String = withContext(Dispatchers.IO) {
         val result = Shell.cmd("dumpsys account 2>&1 | grep -v 'authtoken\\|password\\|token' | head -100").exec()
         result.out.joinToString("\n")
     }
 
-    // ─────────────────────────────────────────────────────────────
-    // CACHE FLUSH
-    // ─────────────────────────────────────────────────────────────
-
-    /**
-     * Notify AccountManagerService that accounts have changed.
-     * This triggers cache invalidation and makes visibility changes effective.
-     */
     private fun broadcastAccountsChanged() {
         Shell.cmd("am broadcast -a android.accounts.LOGIN_ACCOUNTS_CHANGED_ACTION 2>/dev/null").exec()
-        // Also trigger via Settings package which has permission
         Shell.cmd("am broadcast --user 0 -a android.accounts.LOGIN_ACCOUNTS_CHANGED_ACTION 2>/dev/null").exec()
     }
 }

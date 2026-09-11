@@ -231,8 +231,18 @@ private fun RootStatusPanel(rootStatus: RootStatus?) {
                 StatusRow("Root Type", rootStatus.rootType,
                     if (rootStatus.isRootAvailable) GuardColors.GreenSuccess else GuardColors.RedError)
 
-                StatusRow("DB Access", if (rootStatus.isPrivilegeVerified) "accounts_de.db readable" else "Cannot access",
+                val dbAccessText = if (rootStatus.isPrivilegeVerified) {
+                    if (rootStatus.engineName.isNotEmpty()) "Accessible (${rootStatus.engineName})" else "Database verified"
+                } else {
+                    if (rootStatus.errorMessage.isNotEmpty()) "Error: ${rootStatus.errorMessage.take(35)}" else "Cannot access"
+                }
+                StatusRow("DB Access", dbAccessText,
                     if (rootStatus.isPrivilegeVerified) GuardColors.GreenSuccess else GuardColors.RedError)
+
+                if (rootStatus.resolvedDbPath.isNotEmpty()) {
+                    val dbName = rootStatus.resolvedDbPath.substringAfterLast('/')
+                    StatusRow("Active DB", dbName, GuardColors.TextSecondary)
+                }
 
                 StatusRow("Vector/LSPosed",
                     if (rootStatus.vectorDetected) "Detected — Settings hiding available" else "Not detected — Settings not covered",

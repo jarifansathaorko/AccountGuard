@@ -56,10 +56,24 @@ log "Policy DB found at $POLICY_DB"
 
 POLICY_COUNT=0
 
+# Locate sqlite3 binary
+SQLITE_BIN="sqlite3"
+for candidate in "sqlite3" "/system/bin/sqlite3" "/system/xbin/sqlite3" "/data/adb/ksu/bin/sqlite3" "/data/adb/magisk/sqlite3" "/data/adb/ap/bin/sqlite3"; do
+    if which "$candidate" >/dev/null 2>&1 || [ -x "$candidate" ]; then
+        SQLITE_BIN="$candidate"
+        break
+    fi
+done
+
+# Query policy DB for all HIDDEN policies (visibility_state = 4)
+# Then apply each one to accounts_de.db
+
+POLICY_COUNT=0
+
 # Get all hidden policies: account_name, target_package, visibility_state
-sqlite3 "$POLICY_DB" "SELECT account_name, target_package, visibility_state FROM policies WHERE visibility_state = 4;" 2>/dev/null | while IFS='|' read -r account_name target_package visibility_state; do
+"$SQLITE_BIN" "$POLICY_DB" "SELECT account_name, target_package, visibility_state FROM policies WHERE visibility_state = 4;" 2>/dev/null | while IFS='|' read -r account_name target_package visibility_state; do
     # Get account DB ID from accounts_de.db
-    ACCOUNT_ID=$(sqlite3 "$ACCOUNTS_DE" "SELECT _id FROM accounts WHERE name='${account_name}' AND type='com.google' LIMIT 1;" 2>/dev/null)
+    ACCOUNT_ID=$("$SQLITE_BIN" "$ACCOUNTS_DE" "SELECT _id FROM accounts WHERE name='${account_name}' AND type='com.google' LIMIT 1;" 2>/dev/null)
 
     if [ -z "$ACCOUNT_ID" ]; then
         log "WARN: Account '$account_name' not found in accounts_de.db — skipping"
@@ -85,7 +99,7 @@ sqlite3 "$POLICY_DB" "SELECT account_name, target_package, visibility_state FROM
     esac
 
     # Apply visibility to accounts_de.db
-    sqlite3 "$ACCOUNTS_DE" \
+    "$SQLITE_BIN" "$ACCOUNTS_DE" \
         "INSERT OR REPLACE INTO visibility (accounts_id, package_name, visibility) VALUES (${ACCOUNT_ID}, '${PKG_KEY}', ${visibility_state});" \
         2>/dev/null
 
@@ -97,7 +111,7 @@ sqlite3 "$POLICY_DB" "SELECT account_name, target_package, visibility_state FROM
     fi
 
     # Also apply to CE db (may fail if not unlocked yet — that's fine)
-    sqlite3 "$ACCOUNTS_CE" \
+    "$SQLITE_BIN" "$ACCOUNTS_CE" \
         "INSERT OR REPLACE INTO visibility (accounts_id, package_name, visibility) VALUES (${ACCOUNT_ID}, '${PKG_KEY}', ${visibility_state});" \
         2>/dev/null
 done

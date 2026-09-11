@@ -17,19 +17,28 @@ USER_ID=0
 ACCOUNTS_DE="/data/system_de/${USER_ID}/accounts_de.db"
 ACCOUNTS_CE="/data/system_ce/${USER_ID}/accounts_ce.db"
 
+# Locate sqlite3 binary
+SQLITE_BIN="sqlite3"
+for candidate in "sqlite3" "/system/bin/sqlite3" "/system/xbin/sqlite3" "/data/adb/ksu/bin/sqlite3" "/data/adb/magisk/sqlite3" "/data/adb/ap/bin/sqlite3"; do
+    if which "$candidate" >/dev/null 2>&1 || [ -x "$candidate" ]; then
+        SQLITE_BIN="$candidate"
+        break
+    fi
+done
+
 echo "=================================================="
 echo " AccountGuard Emergency Recovery"
 echo "=================================================="
 echo ""
 echo "Current visibility entries in accounts_de.db:"
-sqlite3 "$ACCOUNTS_DE" "SELECT a.name, v.package_name, v.visibility FROM visibility v JOIN accounts a ON v.accounts_id = a._id ORDER BY a.name, v.package_name;" 2>/dev/null
+"$SQLITE_BIN" "$ACCOUNTS_DE" "SELECT a.name, v.package_name, v.visibility FROM visibility v JOIN accounts a ON v.accounts_id = a._id ORDER BY a.name, v.package_name;" 2>/dev/null
 echo ""
 
 echo "Clearing all custom visibility entries..."
-sqlite3 "$ACCOUNTS_DE" "DELETE FROM visibility;" 2>&1
+"$SQLITE_BIN" "$ACCOUNTS_DE" "DELETE FROM visibility;" 2>&1
 echo "DE database cleared: $?"
 
-sqlite3 "$ACCOUNTS_CE" "DELETE FROM visibility;" 2>/dev/null
+"$SQLITE_BIN" "$ACCOUNTS_CE" "DELETE FROM visibility;" 2>/dev/null
 echo "CE database cleared (may fail if locked — normal)"
 
 echo ""
@@ -39,7 +48,7 @@ echo "Broadcast sent"
 
 echo ""
 echo "Verification — remaining visibility entries:"
-sqlite3 "$ACCOUNTS_DE" "SELECT COUNT(*) FROM visibility;" 2>/dev/null
+"$SQLITE_BIN" "$ACCOUNTS_DE" "SELECT COUNT(*) FROM visibility;" 2>/dev/null
 
 echo ""
 echo "=================================================="

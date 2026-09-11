@@ -100,5 +100,7 @@ data class RootStatus(
     val isPrivilegeVerified: Boolean,
     val ksuVersion: String = "",
     val vectorDetected: Boolean = false,
-    val errorMessage: String = ""
+    val errorMessage: String = "",
+    val engineName: String = "",
+    val resolvedDbPath: String = ""
 )
