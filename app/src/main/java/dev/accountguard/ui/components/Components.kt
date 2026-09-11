@@ -212,7 +212,7 @@ fun AccountRowCard(
 
 @Composable
 fun TargetToggleRow(
-    target: Target,
+    target: dev.accountguard.data.model.Target,
     isHidden: Boolean,
     isApplying: Boolean,
     onToggle: () -> Unit,
